@@ -73,6 +73,18 @@
   .toast-item.err { border-color: var(--red); }
   .muted { color: var(--muted); font-size: 12px; }
   .mono { font-family: ui-monospace, monospace; font-size: 12px; }
+  .form-row { display: flex; gap: 10px; align-items: center; margin-bottom: 10px; flex-wrap: wrap; }
+  .form-row label { font-size: 13px; color: var(--muted); }
+  select, input[type="number"] {
+    background: #0b1220; border: 1px solid var(--line); color: var(--text);
+    border-radius: 7px; padding: 7px 10px; font-size: 13px; min-width: 160px;
+  }
+  input[type="number"] { min-width: 140px; }
+  .patch-pick {
+    border: 1px dashed var(--line); border-radius: 8px; padding: 12px 14px;
+    color: var(--muted); font-size: 13px; cursor: pointer; display: inline-block;
+  }
+  .patch-pick:hover { border-color: var(--blue); color: var(--text); }
 </style>
 </head>
 <body>
@@ -101,14 +113,39 @@
     </section>
 
     <section class="panel">
-      <h2>已确认文件</h2>
-      <table>
-        <thead><tr><th>文件名</th><th>大小</th><th>条带</th><th>操作</th></tr></thead>
-        <tbody id="files"></tbody>
-      </table>
-      <div id="files-empty" class="muted">暂无已确认文件</div>
+      <h2>补丁覆盖（回填预留字节）</h2>
+      <p class="muted" style="margin-top:0">
+        从 0 起算字节偏移，仅重写补丁涉及的条带；文件编号与长度不变。
+        三盘全部在线才可提交，补丁越界会被拒绝，未提交的覆盖在失败或重启后不生效。
+      </p>
+      <div class="form-row">
+        <label for="patch-file">目标文件</label>
+        <select id="patch-file"><option value="">（先上传文件）</option></select>
+      </div>
+      <div class="form-row">
+        <label for="patch-offset">字节偏移（从 0 起算）</label>
+        <input type="number" id="patch-offset" min="0" step="1" value="0">
+      </div>
+      <div class="form-row">
+        <label class="patch-pick" for="patch-input">选择补丁文件</label>
+        <input type="file" id="patch-input" style="display:none">
+        <span id="patch-picked" class="muted">未选择</span>
+      </div>
+      <div class="form-row">
+        <button class="primary" id="patch-submit">提交覆盖</button>
+        <span id="patch-status" class="muted"></span>
+      </div>
     </section>
   </div>
+
+  <section class="panel">
+    <h2>已确认文件</h2>
+    <table>
+      <thead><tr><th>文件名</th><th>大小</th><th>版本</th><th>条带</th><th>SHA-256</th><th>操作</th></tr></thead>
+      <tbody id="files"></tbody>
+    </table>
+    <div id="files-empty" class="muted">暂无已确认文件</div>
+  </section>
 </main>
 <div id="toast"></div>
 
@@ -205,7 +242,9 @@ async function refresh() {
     tr.innerHTML = `
       <td>${escapeHtml(f.name)}<div class="muted mono">${f.id}</div></td>
       <td>${fmtSize(f.size)}</td>
+      <td>v${f.version || 1}</td>
       <td>${f.stripe_count}</td>
+      <td class="mono" style="max-width:160px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${f.sha256 || ""}">${(f.sha256 || "").slice(0, 16)}</td>
       <td><a href="/api/files/${f.id}">下载</a>
           <a href="#" data-del="${f.id}" data-name="${escapeHtml(f.name)}">删除</a></td>`;
     tbody.appendChild(tr);
@@ -220,6 +259,14 @@ async function refresh() {
       } catch (e) { toast(e.message, false); }
     };
   });
+
+  // Keep the patch target select in sync, preserving the current choice.
+  const sel = $("#patch-file");
+  const prev = sel.value;
+  sel.innerHTML = files.length
+    ? files.map((f) => `<option value="${f.id}">${escapeHtml(f.name)}（${fmtSize(f.size)} · v${f.version || 1}）</option>`).join("")
+    : '<option value="">（先上传文件）</option>';
+  if (prev && files.some((f) => f.id === prev)) sel.value = prev;
 }
 
 function escapeHtml(s) {
@@ -255,6 +302,47 @@ input.onchange = () => uploadFiles(input.files);
 ["dragleave", "drop"].forEach((ev) =>
   drop.addEventListener(ev, (e) => { e.preventDefault(); drop.classList.remove("drag"); }));
 drop.addEventListener("drop", (e) => uploadFiles(e.dataTransfer.files));
+
+// ---- patch overwrite ---------------------------------------------------
+let pickedPatch = null;
+const patchInput = $("#patch-input");
+patchInput.onchange = () => {
+  pickedPatch = patchInput.files[0] || null;
+  $("#patch-picked").textContent = pickedPatch
+    ? `${pickedPatch.name}（${fmtSize(pickedPatch.size)}）` : "未选择";
+};
+$("#patch-submit").onclick = async () => {
+  const fileId = $("#patch-file").value;
+  const offsetRaw = $("#patch-offset").value;
+  const status = $("#patch-status");
+  if (!fileId) { toast("请先选择目标文件", false); return; }
+  if (!pickedPatch) { toast("请选择补丁文件", false); return; }
+  const offset = Number(offsetRaw);
+  if (!Number.isInteger(offset) || offset < 0) {
+    toast("字节偏移必须是 >= 0 的整数", false); return;
+  }
+  const btn = $("#patch-submit");
+  btn.disabled = true;
+  status.textContent = "覆盖提交中…";
+  const fd = new FormData();
+  fd.append("offset", String(offset));
+  fd.append("patch", pickedPatch);
+  try {
+    const r = await fetch(`/api/files/${fileId}/patch`,
+                          {method: "POST", body: fd});
+    const body = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(body.detail || body.error || ("HTTP " + r.status));
+    const f = body.file;
+    status.textContent = `覆盖成功：当前 v${f.version || 1}`;
+    toast(`覆盖成功，新摘要 ${(f.sha256 || "").slice(0, 16)}…`);
+  } catch (e) {
+    status.textContent = "覆盖失败：" + e.message;
+    toast("覆盖失败：" + e.message, false);
+  } finally {
+    btn.disabled = false;
+    refresh();
+  }
+};
 
 refresh();
 setInterval(refresh, 2000);

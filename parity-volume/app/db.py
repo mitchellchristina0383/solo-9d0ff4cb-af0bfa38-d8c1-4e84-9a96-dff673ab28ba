@@ -3,7 +3,10 @@
 A single guarded connection is shared between request handlers and the
 background rebuild thread.  SQLite runs in WAL mode; an application-level
 re-entrant lock additionally serialises multi-statement transactions so the
-state machine (upload / rebuild / disk transitions) cannot interleave.
+state machine (upload / overwrite / rebuild / disk transitions) cannot
+interleave.  Tables cover files (with an overwrite version counter),
+stripes/blocks, disks, rebuild jobs and crash-recovery records for patch
+overwrite jobs.
 """
 
 from __future__ import annotations
@@ -22,7 +25,8 @@ CREATE TABLE IF NOT EXISTS files (
     chunk_size   INTEGER NOT NULL,
     stripe_count INTEGER NOT NULL,
     sha256       TEXT,
-    status       TEXT NOT NULL CHECK (status IN ('uploading', 'confirmed')),
+    version      INTEGER NOT NULL DEFAULT 1,
+    status       TEXT NOT NULL CHECK (status IN ('uploading', 'confirmed', 'overwriting')),
     created_at   REAL NOT NULL,
     confirmed_at REAL
 );
@@ -68,6 +72,26 @@ CREATE TABLE IF NOT EXISTS rebuild_jobs (
     started_at    REAL NOT NULL,
     finished_at   REAL
 );
+
+-- Crash-safe record of an in-progress (or finished) patch overwrite.
+-- stage:
+--   preparing  rollback data is being persisted; no live block touched yet
+--   prepared   every old block backed up; live blocks may be rewritten
+--   committed  all stripes rewritten; only the summary transaction remains
+--   done       fully committed and visible as the new file version
+CREATE TABLE IF NOT EXISTS overwrite_jobs (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    file_id       TEXT NOT NULL,
+    state         TEXT NOT NULL CHECK (state IN ('running', 'done', 'failed')),
+    stage         TEXT NOT NULL CHECK (stage IN
+                    ('preparing', 'prepared', 'committed', 'done')),
+    patch_offset  INTEGER NOT NULL,
+    patch_size    INTEGER NOT NULL,
+    rollback_dir  TEXT NOT NULL,
+    error         TEXT,
+    created_at    REAL NOT NULL,
+    finished_at   REAL
+);
 """
 
 
@@ -83,17 +107,49 @@ class Database:
         self.conn.execute("PRAGMA synchronous=NORMAL")
         self.conn.execute("PRAGMA busy_timeout=10000")
         self.conn.execute("PRAGMA foreign_keys=ON")
-        with self._lock, self.conn:
+        with self._lock:
+            # executescript() commits any pending transaction first, which
+            # matters for the PRAGMAs inside the legacy-schema migration.
             self.conn.executescript(SCHEMA)
+            self._migrate_schema()
             now = time.time()
-            for i in range(3):
-                self.conn.execute(
-                    "INSERT OR IGNORE INTO disks(disk_index, state, updated_at) "
-                    "VALUES (?, 'online', ?)",
-                    (i, now),
-                )
+            with self.conn:
+                for i in range(3):
+                    self.conn.execute(
+                        "INSERT OR IGNORE INTO disks(disk_index, state, "
+                        "updated_at) VALUES (?, 'online', ?)",
+                        (i, now),
+                    )
         # True only when this process created the database file itself.
         self.is_fresh = not existed
+
+    def _migrate_schema(self) -> None:
+        """Upgrade databases created by older releases in place."""
+        cols = {
+            r["name"] for r in self.conn.execute("PRAGMA table_info(files)")
+        }
+        if "version" not in cols:
+            # Rebuild the table so the status CHECK admits 'overwriting' too.
+            # The whole script runs via executescript(), which commits any
+            # open transaction first: otherwise the foreign_keys PRAGMA would
+            # be a silent no-op and DROP TABLE could fail on child rows.
+            self.conn.executescript(
+                "PRAGMA foreign_keys=OFF;\n"
+                "CREATE TABLE files_new ("
+                "id TEXT PRIMARY KEY, name TEXT NOT NULL, size INTEGER NOT NULL, "
+                "chunk_size INTEGER NOT NULL, stripe_count INTEGER NOT NULL, "
+                "sha256 TEXT, version INTEGER NOT NULL DEFAULT 1, "
+                "status TEXT NOT NULL CHECK (status IN "
+                "('uploading', 'confirmed', 'overwriting')), "
+                "created_at REAL NOT NULL, confirmed_at REAL);\n"
+                "INSERT INTO files_new(id, name, size, chunk_size, stripe_count, "
+                "sha256, version, status, created_at, confirmed_at) "
+                "SELECT id, name, size, chunk_size, stripe_count, sha256, 1, "
+                "status, created_at, confirmed_at FROM files;\n"
+                "DROP TABLE files;\n"
+                "ALTER TABLE files_new RENAME TO files;\n"
+                "PRAGMA foreign_keys=ON;\n"
+            )
 
     @property
     def lock(self) -> threading.RLock:
@@ -165,7 +221,9 @@ class Database:
     def list_files(self, only_confirmed: bool = True) -> list[dict[str, Any]]:
         sql = "SELECT * FROM files"
         if only_confirmed:
-            sql += " WHERE status='confirmed'"
+            # An 'overwriting' file is still a previously confirmed file whose
+            # download is blocked by the in-memory file lock, not by listing.
+            sql += " WHERE status IN ('confirmed', 'overwriting')"
         sql += " ORDER BY created_at DESC"
         with self._lock:
             rows = self.conn.execute(sql).fetchall()
@@ -180,9 +238,80 @@ class Database:
 
     def delete_file_rows(self, file_id: str) -> None:
         with self._lock, self.conn:
+            self.conn.execute("DELETE FROM overwrite_jobs WHERE file_id=?",
+                              (file_id,))
             self.conn.execute("DELETE FROM blocks WHERE file_id=?", (file_id,))
             self.conn.execute("DELETE FROM stripes WHERE file_id=?", (file_id,))
             self.conn.execute("DELETE FROM files WHERE id=?", (file_id,))
+
+    def set_file_status(self, file_id: str, status: str) -> None:
+        with self._lock, self.conn:
+            self.conn.execute(
+                "UPDATE files SET status=? WHERE id=?", (status, file_id)
+            )
+
+    def update_file_summary(self, file_id: str, sha256: str, version: int) -> None:
+        """Commit the post-overwrite summary atomically (same txn as status)."""
+        with self._lock, self.conn:
+            self.conn.execute(
+                "UPDATE files SET sha256=?, version=?, status='confirmed' "
+                "WHERE id=?",
+                (sha256, version, file_id),
+            )
+
+    def overwriting_files(self) -> list[dict[str, Any]]:
+        with self._lock:
+            rows = self.conn.execute(
+                "SELECT * FROM files WHERE status='overwriting'"
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    # -- overwrite jobs --------------------------------------------------
+    def create_overwrite_job(self, file_id: str, patch_offset: int,
+                             patch_size: int, rollback_dir: str) -> int:
+        with self._lock, self.conn:
+            cur = self.conn.execute(
+                "INSERT INTO overwrite_jobs(file_id, state, stage, patch_offset, "
+                "patch_size, rollback_dir, created_at) "
+                "VALUES (?, 'running', 'preparing', ?, ?, ?, ?)",
+                (file_id, patch_offset, patch_size, rollback_dir, time.time()),
+            )
+            return int(cur.lastrowid)
+
+    def set_overwrite_stage(self, job_id: int, stage: str) -> None:
+        with self._lock, self.conn:
+            self.conn.execute(
+                "UPDATE overwrite_jobs SET stage=? WHERE id=?", (stage, job_id)
+            )
+
+    def finish_overwrite_job(self, job_id: int, state: str,
+                             error: str | None) -> None:
+        with self._lock, self.conn:
+            self.conn.execute(
+                "UPDATE overwrite_jobs SET state=?, stage=CASE WHEN ?='done' "
+                "THEN 'done' ELSE stage END, error=?, finished_at=? WHERE id=?",
+                (state, state, error, time.time(), job_id),
+            )
+
+    def running_overwrite_jobs(self) -> list[dict[str, Any]]:
+        with self._lock:
+            rows = self.conn.execute(
+                "SELECT * FROM overwrite_jobs WHERE state='running' ORDER BY id"
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def last_overwrite_job(self, file_id: str) -> dict[str, Any] | None:
+        with self._lock:
+            row = self.conn.execute(
+                "SELECT * FROM overwrite_jobs WHERE file_id=? ORDER BY id DESC "
+                "LIMIT 1",
+                (file_id,),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def delete_overwrite_job(self, job_id: int) -> None:
+        with self._lock, self.conn:
+            self.conn.execute("DELETE FROM overwrite_jobs WHERE id=?", (job_id,))
 
     # -- stripes & blocks ------------------------------------------------
     def insert_stripe(self, stripe: dict[str, Any], healthy: bool) -> None:

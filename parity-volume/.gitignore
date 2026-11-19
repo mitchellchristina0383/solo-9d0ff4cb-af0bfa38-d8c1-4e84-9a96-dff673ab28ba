@@ -5,4 +5,5 @@ data/disk*.failed-*/
 data/meta/*.db
 data/meta/*.db-wal
 data/meta/*.db-shm
+data/meta/overwrite-rollback/
 .pytest_cache/

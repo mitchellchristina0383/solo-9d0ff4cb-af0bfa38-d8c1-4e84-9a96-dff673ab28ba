@@ -6,12 +6,17 @@ import logging
 import os
 from pathlib import Path
 
-from fastapi import FastAPI, HTTPException, Request, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from urllib.parse import quote
 
-from .volume import DiskUnavailableError, UnrecoverableError, Volume
+from .volume import (
+    DiskUnavailableError,
+    PatchOutOfBoundsError,
+    UnrecoverableError,
+    Volume,
+)
 
 logger = logging.getLogger("parity_volume")
 
@@ -53,6 +58,13 @@ def _unrecoverable_handler(_: Request, exc: UnrecoverableError):
                         content={"error": "unrecoverable", "detail": str(exc)})
 
 
+@app.exception_handler(PatchOutOfBoundsError)
+def _patch_oob_handler(_: Request, exc: PatchOutOfBoundsError):
+    return JSONResponse(status_code=400,
+                        content={"error": "patch_out_of_bounds",
+                                 "detail": str(exc)})
+
+
 @app.get("/", response_class=HTMLResponse)
 def index() -> HTMLResponse:
     return HTMLResponse((WEB_DIR / "index.html").read_text(encoding="utf-8"))
@@ -78,6 +90,23 @@ async def upload_file(file: UploadFile):
         raise
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(status_code=500, detail=f"upload failed: {exc}")
+    return {"file": meta}
+
+
+@app.post("/api/files/{file_id}/patch")
+async def patch_file(file_id: str,
+                     offset: int = Form(...),
+                     patch: UploadFile = File(...)):
+    data = await patch.read()
+    try:
+        meta = volume.apply_patch(file_id, offset, data)
+    except FileNotFoundError:
+        raise HTTPException(status_code=404, detail="file not found")
+    except (DiskUnavailableError, UnrecoverableError, PatchOutOfBoundsError):
+        raise
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=500,
+                            detail=f"patch failed: {exc}")
     return {"file": meta}
 
 
